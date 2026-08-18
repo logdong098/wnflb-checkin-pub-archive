@@ -171,15 +171,28 @@ def extract_message(html):
 # ========================= 登录（账号密码） =========================
 
 def fetch_login_page(session):
-    """GET 登录页，返回 (html, formhash, loginhash)"""
-    resp = session.get(LOGIN_PAGE_URL, timeout=TIMEOUT)
-    html = get_page_text(resp)
-    formhash_m = re.search(r'name="formhash"\s+value="([a-f0-9]+)"', html)
-    formhash = formhash_m.group(1) if formhash_m else None
-    # loginhash 在表单 action 的 URL 里
-    lh_m = re.search(r"loginhash=([A-Za-z0-9]+)", html)
-    loginhash = lh_m.group(1) if lh_m else None
-    return html, formhash, loginhash
+    """GET 登录页，返回 (html, formhash, loginhash)，网络异常时自动重试。"""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = session.get(LOGIN_PAGE_URL, timeout=TIMEOUT)
+            html = get_page_text(resp)
+            formhash_m = re.search(
+                r'name="formhash"\s+value="([a-f0-9]+)"', html
+            )
+            formhash = formhash_m.group(1) if formhash_m else None
+            # loginhash 在表单 action 的 URL 里
+            lh_m = re.search(r"loginhash=([A-Za-z0-9]+)", html)
+            loginhash = lh_m.group(1) if lh_m else None
+            return html, formhash, loginhash
+        except requests.RequestException as e:
+            print(
+                f"  [网络] 第 {attempt}/{MAX_RETRIES} 次获取登录页失败: {e}"
+            )
+            if attempt < MAX_RETRIES:
+                delay = RETRY_DELAY * (2 ** (attempt - 1))
+                print(f"  [网络] {delay} 秒后重试 ...")
+                time.sleep(delay)
+    return "", None, None
 
 
 def detect_captcha(html):
