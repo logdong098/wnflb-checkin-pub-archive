@@ -41,7 +41,7 @@
 2. 进入 `Settings → Secrets and variables → Actions → New repository secret`，添加：
    - `FORUM_USERNAME`：论坛账号（**必填**）
    - `FORUM_PASSWORD`：论坛密码（**必填**）
-   - `FORUM_COOKIE`：（可选）直接填 Cookie 字符串，优先级高于账号密码登录
+   - `FORUM_COOKIE`：（可选）直接填 Cookie 字符串（**优先级低于** `cookies.json` 缓存，仅作缓存丢失时的兜底）
    - `PUSHPLUS_TOKEN` / `SERVERCHAN_KEY`：（可选）微信推送通知
 3. 进入 `Actions` 标签页，手动 **Run workflow** 跑一次验证；之后会按 cron
    （北京时间 01:00 / 22:00）自动运行。
@@ -56,6 +56,36 @@
 > 本地（固定 IP）运行同样由 `cookies.json` 复用。若 Actions 连不上论坛（网络原因），可改用本地运行或自建国内 runner。
 
 ---
+
+## 自动续期：验证码 OCR 实战结论（2026-11）
+
+GitHub Actions 的运行机每次都换 IP，属于论坛判定的「风险 IP」，**登录页当次就带验证码**
+（不是提交后才挑战）。脚本为此做了三分支自适应，并在 2026-11-17 实测跑通：
+
+| 分支 | 触发条件 | 处理方式 |
+|------|----------|----------|
+| A 无码直提 | 登录页无验证码（老/可信 IP） | 直接 POST 账号密码 |
+| B 登录页带码 | **Actions / 风控 IP 常态** | 拉图 → ddddocr 识别 → `action=check` 权威校验 → 带 `seccodeverify`+`seccodemodid` 提交，验证码错就换图重试 |
+| C 提交后二次挑战 | 海外 IP | 用 `auth` 令牌 + 验证码完成登录 |
+
+提升 OCR 命中率的三层手段：
+
+1. **双模型**：`DdddOcr()` + `DdddOcr(beta=True)` 交叉识别；
+2. **多变体**：Pillow 预处理（灰度 / 2-3 倍 LANCZOS 放大 / autocontrast / 120·160·200 三档二值化），一张图多猜几次；
+3. **多图 + 权威校验**：每轮换一张新图，每个候选都过 `misc.php?mod=seccode&action=check`，**命中即停**（默认最多 12 张，环境变量 `CAPTCHA_MAX_IMAGES` 可调）。验证码被拒**不消耗账号错误次数**。
+
+带验证码登录成功后，Cookie 写入 cache，后续运行直接复用，不再碰验证码。
+
+### 强制验证自动续期（调试用）
+
+Actions → 福利吧自动签到 → **Run workflow**，勾选 `force_login`：
+跳过所有 Cookie 直走「账号密码 + 验证码」，日志里能看到每轮的拉图/变体/命中情况。
+日常定时任务不要勾。
+
+### Cookie 取值优先级（避坑）
+
+`cookies.json` 缓存 **优先于** `FORUM_COOKIE` 环境变量。若反过来，secret 里那份静态 cookie
+过期后会一直压住自动登录刚刷出来的新缓存，表现为「自动登录成功、下次仍失败」。
 
 ## 方式二：本地运行
 
