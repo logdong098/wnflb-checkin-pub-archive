@@ -4,7 +4,16 @@ on:
   schedule:
     # 北京时间 1:00 与 22:00（对应 UTC 17:00 / 14:00）
     - cron: "0 17,14 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      force_login:
+        description: "跳过 Cookie，强制用账号密码+验证码重新登录（验证自动续期用）"
+        type: boolean
+        default: false
+      captcha_max_images:
+        description: "验证码最多换图次数"
+        type: string
+        default: "12"
 
 permissions:
   contents: read
@@ -42,6 +51,8 @@ jobs:
           FORUM_COOKIE: ${{ secrets.FORUM_COOKIE }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          FORCE_LOGIN: ${{ inputs.force_login && '1' || '0' }}
+          CAPTCHA_MAX_IMAGES: ${{ inputs.captcha_max_images || '12' }}
         run: python wnflb_checkin.py
 
       - name: 删除旧 Cookie 缓存（重新登录后）

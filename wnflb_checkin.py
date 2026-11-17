@@ -24,6 +24,7 @@
 """
 
 import argparse
+import io
 import json
 import os
 import re
@@ -41,6 +42,8 @@ LOGIN_PAGE_URL = BASE_URL + "/member.php?mod=logging&action=login"
 TIMEOUT = 30
 MAX_RETRIES = 3
 RETRY_DELAY = 5
+# 验证码最多拉多少张新图来试（每张都用 action=check 权威校验，命中即停）
+CAPTCHA_MAX_IMAGES = int(os.environ.get("CAPTCHA_MAX_IMAGES", "12"))
 
 HEADERS = {
     "User-Agent": (
@@ -97,19 +100,27 @@ def fetch_forum(session):
 # ========================= Cookie 读写 =========================
 
 def load_cookies(session, raw_cookie, cookie_file):
-    """把 cookie 载入 session。返回是否成功载入。"""
-    if raw_cookie:
-        session.cookies.update(parse_cookies(raw_cookie))
-        return True
+    """把 cookie 载入 session。返回是否成功载入。
+
+    顺序：**缓存文件优先**，其次 FORUM_COOKIE 环境变量。
+    缓存文件是脚本自动登录时写入的最新会话；若让 FORUM_COOKIE 优先，
+    则 secret 里那份静态 cookie 过期后会一直压住自动登录刷出来的新缓存，
+    导致「自动重新登录明明成功了、下次还是拿旧 cookie 失败」。
+    """
     if cookie_file and os.path.exists(cookie_file):
         try:
             with open(cookie_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict) and data:
                 session.cookies.update(data)
+                print(f"  [Cookie] 已从缓存文件 {cookie_file} 载入 {len(data)} 项")
                 return True
         except Exception as e:
             print(f"  [Cookie] 读取缓存失败: {e}")
+    if raw_cookie:
+        session.cookies.update(parse_cookies(raw_cookie))
+        print("  [Cookie] 已从环境变量 FORUM_COOKIE 载入")
+        return True
     return False
 
 
@@ -267,22 +278,76 @@ def extract_login_fields(html):
     )
 
 
-def solve_captcha(session, cap):
+_OCR_ENGINES = None
+
+
+def _ocr_engines():
+    """懒加载 ddddocr（默认模型 + beta 模型），两个引擎交叉识别提升命中率。"""
+    global _OCR_ENGINES
+    if _OCR_ENGINES is None:
+        import ddddocr  # 仅在需要验证码时才 import
+
+        engines = [ddddocr.DdddOcr(show_ad=False)]
+        try:
+            engines.append(ddddocr.DdddOcr(show_ad=False, beta=True))
+            print("  [验证码] 已启用 ddddocr 双模型（默认 + beta）")
+        except Exception:
+            print("  [验证码] beta 模型不可用，仅用默认模型")
+        _OCR_ENGINES = engines
+    return _OCR_ENGINES
+
+
+def _png_bytes(im):
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _captcha_variants(raw):
+    """把验证码原图扩成多个预处理变体（含原图）。
+
+    论坛验证码带干扰点/干扰线，不同预处理的识别成功率差异很大，
+    与其“一张图只能猜一次”，不如一张图多猜几次，再用 action=check 筛。
     """
-    拉取验证码图片并用 ddddocr 识别。
-    多次重试（每次换一张新图），提高识别率。
-    返回识别出的验证码字符串，失败返回 None。
+    variants = [raw]
+    try:
+        from PIL import Image, ImageOps
+
+        im = Image.open(io.BytesIO(raw))
+        gray = im.convert("L")
+        for scale in (2, 3):
+            big = gray.resize((gray.width * scale, gray.height * scale), Image.LANCZOS)
+            big = ImageOps.autocontrast(big)
+            variants.append(_png_bytes(big))
+            for th in (120, 160, 200):
+                bin_img = big.point(lambda p, t=th: 255 if p > t else 0, mode="1")
+                variants.append(_png_bytes(bin_img))
+    except Exception as e:
+        print(f"  [验证码] 图像预处理不可用（仅用原图）: {e}")
+    return variants
+
+
+def solve_captcha(session, cap, max_images=None):
+    """拉验证码图 → ddddocr 多模型多变体识别 → 用 action=check 权威校验。
+
+    返回 (code, verified)：
+      - verified=True：该 code 已通过服务端校验，必然可用；
+      - verified=False：全部候选都没通过，返回最后一个候选供调用方兜底提交。
+    每次循环换一张新图（update 参数变），因此尝试次数不受单图限制。
     """
     try:
-        import ddddocr  # 仅在需要验证码时才 import
+        engines = _ocr_engines()
     except ImportError:
         print("  [验证码] 未安装 ddddocr，请先 pip install ddddocr")
-        return None
+        return None, False
 
-    ocr = ddddocr.DdddOcr(show_ad=False)
+    max_images = max_images or CAPTCHA_MAX_IMAGES
     # 论坛/WAF 对 seccode 图片接口要求同源 Referer，否则返回 Access Denied
     headers = {"Referer": LOGIN_PAGE_URL}
-    for attempt in range(1, 4):
+    tried = set()
+    last_code = None
+
+    for idx in range(1, max_images + 1):
         try:
             update = str(int(time.time() * 1000))
             img_url = (
@@ -290,19 +355,33 @@ def solve_captcha(session, cap):
                 f"&update={update}&idhash={cap['idhash']}"
             )
             r = session.get(img_url, timeout=TIMEOUT, headers=headers)
-            # 校验确实是图片（PNG/JPEG 魔数），避免把 Access Denied 当图片识别
             if r.status_code != 200 or len(r.content) < 100:
-                print(f"  [验证码] 第 {attempt} 次拉取图片失败(status={r.status_code}, len={len(r.content)})")
+                print(f"  [验证码] 第 {idx} 次拉图失败(status={r.status_code}, len={len(r.content)})")
                 continue
             if r.content[:4] not in (b"\x89PNG", b"\xff\xd8\xff\xe0", b"\xff\xd8\xff\xe1"):
-                print(f"  [验证码] 第 {attempt} 次返回非图片(可能被拦截), len={len(r.content)}")
+                print(f"  [验证码] 第 {idx} 次返回非图片(可能被拦截), len={len(r.content)}")
                 continue
-            code = ocr.classification(r.content).strip()
-            if code:
-                return code
+
+            for vi, blob in enumerate(_captcha_variants(r.content)):
+                for engine in engines:
+                    try:
+                        code = (engine.classification(blob) or "").strip()
+                    except Exception as e:
+                        print(f"  [验证码] 识别异常(变体{vi}): {e}")
+                        continue
+                    # Discuz 验证码为字母数字，去掉误识别的杂字符
+                    code = re.sub(r"[^0-9A-Za-z]", "", code)
+                    if not code or len(code) < 3 or code in tried:
+                        continue
+                    tried.add(code)
+                    last_code = code
+                    if verify_captcha_code(session, cap, code):
+                        print(f"  [验证码] 第 {idx} 张图/变体{vi} 命中: {code}")
+                        return code, True
+            print(f"  [验证码] 第 {idx}/{max_images} 张图未识别出正确码，换图 ...")
         except Exception as e:
-            print(f"  [验证码] 第 {attempt} 次识别异常: {e}")
-    return None
+            print(f"  [验证码] 第 {idx} 次异常: {e}")
+    return last_code, False
 
 
 def verify_captcha_code(session, cap, code):
@@ -471,15 +550,14 @@ def do_login(session, username, password):
     # 若仍报凭据缺失（auth 失效 / 编码问题），则重拉挑战页拿新 auth 再试。
     last_msg = "验证码识别失败"
     for attempt in range(1, 4):
-        print(f"  [登录] 验证码 idhash={cap['idhash']}，ddddocr 识别中(第{attempt}次) ...")
-        code = solve_captcha(session, cap)
+        print(f"  [登录] 验证码 idhash={cap['idhash']}，ddddocr 识别中(第{attempt}轮) ...")
+        code, verified = solve_captcha(session, cap)
         if not code:
             return False, "验证码识别失败，请检查 ddddocr 或手动处理"
-
-        # 调用验证码校验接口（设置 seccode cookie，确认识别是否正确）
-        if not verify_captcha_code(session, cap, code):
-            print(f"  [登录] 第 {attempt} 次验证码校验未通过，换新图重试 ...")
-            continue
+        if not verified:
+            # action=check 全部未通过：仍用最后一个候选提交一次。
+            # 部分 Discuz 版本不在 check 接口下发标记，真正判定在登录提交时。
+            print(f"  [登录] 第 {attempt} 轮预校验均未通过，用候选 [{code}] 兜底提交 ...")
 
         ok2, last_msg, _ = _submit_login(
             session, c_fh, c_lh, username, password, code, auth,
@@ -662,8 +740,11 @@ def main():
     session.headers.update(HEADERS)
 
     html = None
-    # 1) 尝试用缓存/Cookie 直接登录
-    if load_cookies(session, args.cookie, args.cookie_file):
+    force_login = os.environ.get("FORCE_LOGIN", "").strip().lower() in ("1", "true", "yes")
+    # 1) 尝试用缓存/Cookie 直接登录（FORCE_LOGIN=1 时跳过，用于验证账号密码+验证码链路）
+    if force_login:
+        print("[1] FORCE_LOGIN=1，跳过 Cookie，强制走账号密码登录")
+    elif load_cookies(session, args.cookie, args.cookie_file):
         print("[1] 已载入 Cookie，校验登录态 ...")
         logged, html = verify_login(session)
         if logged:
