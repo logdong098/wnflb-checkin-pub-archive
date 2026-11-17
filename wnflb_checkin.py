@@ -450,6 +450,7 @@ def _submit_login(session, formhash, loginhash, username="", password="",
         }
         if seccode:
             data["seccodeverify"] = seccode
+            data["seccodemodid"] = "member::logging"
             if seccodehash:
                 data["seccodehash"] = seccodehash
 
@@ -493,9 +494,51 @@ def _submit_login(session, formhash, loginhash, username="", password="",
     return False, (msg or "登录失败（未进入登录态）"), txt
 
 
+def _first_submit_with_captcha(session, username, password, rounds=3):
+    """登录页本身就带验证码的情形（GitHub Actions 这类风险 IP 常态）。
+
+    每轮：重新拉登录页 → 换新图识别（action=check 权威校验）→ 带 seccodeverify 直接提交。
+    服务端报“验证码填写错误”就换图重试（不消耗账号错误次数）。
+    返回 (ok, msg, resp_html)。
+    """
+    last_msg = "验证码识别失败"
+    for rnd in range(1, rounds + 1):
+        html, formhash, loginhash = fetch_login_page(session)
+        if not formhash or not loginhash:
+            return False, "无法解析登录页(formhash/loginhash 缺失)", ""
+        cap = detect_captcha(html)
+        if not (cap["needed"] and cap["idhash"]):
+            print("  [登录] 本轮登录页未要求验证码，无验证码直接提交 ...")
+            return _submit_login(session, formhash, loginhash, username, password, None, None)
+
+        print(f"  [登录] 登录页要求验证码 idhash={cap['idhash']}（第 {rnd} 轮）")
+        code, verified = solve_captcha(session, cap)
+        if not code:
+            last_msg = "验证码识别失败，请检查 ddddocr 或手动处理"
+            continue
+        if not verified:
+            print(f"  [登录] 预校验未通过，用候选 [{code}] 兜底提交 ...")
+
+        ok, msg, resp = _submit_login(
+            session, formhash, loginhash, username, password,
+            code, None, cap["seccodehash"],
+        )
+        if ok:
+            return True, msg, resp
+        last_msg = msg
+        if "验证码" in msg:
+            print(f"  [登录] 第 {rnd} 轮验证码未被接受，重新拉登录页换图重试 ...")
+            continue
+        return False, msg, resp
+    return False, last_msg, ""
+
+
 def do_login(session, username, password):
     """
-    账号密码登录（含新 IP 二次验证码挑战）。
+    账号密码登录。三条路径自动适配：
+      A. 登录页无验证码   → 直提直接登录（老 IP）
+      B. 登录页就带验证码 → 识别后带 seccodeverify 登录（GitHub Actions 风险 IP 常态）
+      C. 提交后被二次挑战 → 用 auth 令牌 + 验证码完成登录（海外 IP）
     成功返回 (True, 消息)，失败返回 (False, 消息)。
     """
     print("  [登录] 获取登录页 ...")
@@ -503,12 +546,19 @@ def do_login(session, username, password):
     if not formhash or not loginhash:
         return False, "无法解析登录页(formhash/loginhash 缺失)"
 
-    # 首次尝试：无验证码直接提交（老 IP / 已信任环境通常直接成功）
-    ok, msg, resp_html = _submit_login(
-        session, formhash, loginhash, username, password, None, None
-    )
-    if ok:
-        return True, "登录成功"
+    cap0 = detect_captcha(html)
+    if cap0["needed"] and cap0["idhash"]:
+        print("  [登录] 检测到登录页即要求验证码，走带验证码登录 ...")
+        ok, msg, resp_html = _first_submit_with_captcha(session, username, password)
+        if ok:
+            return True, "登录成功(登录页验证码)"
+    else:
+        # 首次尝试：无验证码直接提交（老 IP / 已信任环境通常直接成功）
+        ok, msg, resp_html = _submit_login(
+            session, formhash, loginhash, username, password, None, None
+        )
+        if ok:
+            return True, "登录成功"
 
     # 被验证码挑战：从第一次提交的响应里直接解析挑战页（auth 由本次响应给出）。
     # 关键：auth 在 HTML 里可能以 %2F 形式存在（含 /），需先 unquote 还原，
